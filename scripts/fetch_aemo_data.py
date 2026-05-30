@@ -16,10 +16,30 @@ Post-5MS note (effective 1 Oct 2021):
   here is a 30-min mean of the 5-min dispatch prices — used by the revenue
   engine as the arbitrage reference.
 
+Network note:
+  AEMO's NEMWeb blocks requests from cloud provider IP ranges.
+  Run this script on your LOCAL machine, not inside a cloud shell.
+
+  Two ways to run it:
+
+  Option A — direct download (run locally):
+    python scripts/fetch_aemo_data.py --region NSW1
+
+  Option B — manual download + local parse:
+    1. In your browser, go to:
+         https://nemweb.com.au/Data_Archive/Wholesale_Electricity/MMSDM/
+         2025/MMSDM_2025_01/MMSDM_Historical_Data_SQLLoader/DATA/
+    2. Download PUBLIC_DVD_DISPATCHPRICE_202501010000.zip and
+                 PUBLIC_DVD_ROOFTOP_PV_ACTUAL_202501010000.zip
+       (repeat for each month)
+    3. Place the ZIPs in any directory, then run:
+         python scripts/fetch_aemo_data.py --region NSW1 --local-zip-dir /path/to/zips
+
 Usage examples:
   python scripts/fetch_aemo_data.py --region NSW1
   python scripts/fetch_aemo_data.py --region VIC1 --year 2025 --months 1 2 3
   python scripts/fetch_aemo_data.py --region QLD1 --duid SOLARSF1  (utility solar)
+  python scripts/fetch_aemo_data.py --region NSW1 --local-zip-dir ~/Downloads/aemo_zips
 
 NEM regions: NSW1  VIC1  QLD1  SA1  TAS1
 """
@@ -52,6 +72,17 @@ NEM_REGIONS = {"NSW1", "VIC1", "QLD1", "SA1", "TAS1"}
 
 OUT_DIR = Path("data/raw")
 
+# AEMO's servers reject requests without a browser-like User-Agent.
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.aemo.com.au/",
+    "Accept": "application/zip,application/octet-stream,*/*",
+}
+
 
 # ---------------------------------------------------------------------------
 # Download helpers
@@ -63,7 +94,7 @@ def _download(url: str, retries: int = 4) -> bytes:
     for attempt in range(retries + 1):
         try:
             log.info("  GET %s", url)
-            r = requests.get(url, timeout=120)
+            r = requests.get(url, headers=_HEADERS, timeout=120)
             r.raise_for_status()
             return r.content
         except requests.RequestException as exc:
@@ -73,6 +104,34 @@ def _download(url: str, retries: int = 4) -> bytes:
             time.sleep(delay)
             delay *= 2
     raise RuntimeError("unreachable")
+
+
+def _load_zip(
+    table: str,
+    year: int,
+    month: int,
+    local_zip_dir: Path | None,
+) -> bytes:
+    """
+    Return raw ZIP bytes — from a local file if --local-zip-dir was given,
+    otherwise download from NEMWeb.
+
+    Local file name convention (same as the MMSDM archive):
+      PUBLIC_DVD_{TABLE}_{YYYY}{MM}010000.zip
+    """
+    filename = f"PUBLIC_DVD_{table}_{year}{month:02d}010000.zip"
+    if local_zip_dir is not None:
+        path = local_zip_dir / filename
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Expected local ZIP not found: {path}\n"
+                f"Download it from:\n"
+                f"  https://nemweb.com.au/Data_Archive/Wholesale_Electricity/MMSDM/"
+                f"{year}/MMSDM_{year}_{month:02d}/MMSDM_Historical_Data_SQLLoader/DATA/{filename}"
+            )
+        log.info("  Reading local file %s", path)
+        return path.read_bytes()
+    return _download(_mmsdm_url(table, year, month))
 
 
 def _mmsdm_url(table: str, year: int, month: int) -> str:
@@ -147,6 +206,7 @@ def fetch_dispatch_prices(
     months: list[int],
     region: str,
     out_dir: Path,
+    local_zip_dir: Path | None = None,
 ) -> pd.DataFrame:
     """
     Download DISPATCHPRICE for each month, filter by region and
@@ -157,10 +217,9 @@ def fetch_dispatch_prices(
     chunks: list[pd.DataFrame] = []
 
     for m in months:
-        url = _mmsdm_url("DISPATCHPRICE", year, m)
         try:
-            raw = _download(url)
-        except requests.HTTPError as e:
+            raw = _load_zip("DISPATCHPRICE", year, m, local_zip_dir)
+        except (requests.HTTPError, FileNotFoundError) as e:
             log.warning("  Skipping %d-%02d dispatch prices: %s", year, m, e)
             continue
 
@@ -216,6 +275,7 @@ def fetch_rooftop_solar(
     months: list[int],
     region: str,
     out_dir: Path,
+    local_zip_dir: Path | None = None,
 ) -> pd.DataFrame:
     """
     Download ROOFTOP_PV_ACTUAL (30-min aggregate rooftop solar by region).
@@ -228,10 +288,9 @@ def fetch_rooftop_solar(
     chunks: list[pd.DataFrame] = []
 
     for m in months:
-        url = _mmsdm_url("ROOFTOP_PV_ACTUAL", year, m)
         try:
-            raw = _download(url)
-        except requests.HTTPError as e:
+            raw = _load_zip("ROOFTOP_PV_ACTUAL", year, m, local_zip_dir)
+        except (requests.HTTPError, FileNotFoundError) as e:
             log.warning("  Skipping %d-%02d rooftop solar: %s", year, m, e)
             continue
 
@@ -270,6 +329,7 @@ def fetch_unit_scada(
     months: list[int],
     duid: str,
     out_dir: Path,
+    local_zip_dir: Path | None = None,
 ) -> pd.DataFrame:
     """
     Download DISPATCH_UNIT_SCADA for a specific DUID (utility-scale solar plant).
@@ -280,10 +340,9 @@ def fetch_unit_scada(
     chunks: list[pd.DataFrame] = []
 
     for m in months:
-        url = _mmsdm_url("DISPATCH_UNIT_SCADA", year, m)
         try:
-            raw = _download(url)
-        except requests.HTTPError as e:
+            raw = _load_zip("DISPATCH_UNIT_SCADA", year, m, local_zip_dir)
+        except (requests.HTTPError, FileNotFoundError) as e:
             log.warning("  Skipping %d-%02d unit SCADA: %s", year, m, e)
             continue
 
@@ -358,22 +417,37 @@ def main() -> None:
         ),
     )
     p.add_argument("--out-dir", type=Path, default=OUT_DIR, help="Output directory for CSVs")
+    p.add_argument(
+        "--local-zip-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Parse ZIPs from a local directory instead of downloading. "
+            "Files must follow AEMO naming: PUBLIC_DVD_{TABLE}_{YYYYMM}010000.zip. "
+            "Use this if NEMWeb is inaccessible (e.g. from a cloud environment)."
+        ),
+    )
     args = p.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    local = args.local_zip_dir
+
+    if local:
+        log.info("=== Local ZIP mode — reading from %s ===", local)
 
     log.info("=== Fetching dispatch prices (%s) ===", args.region)
-    dispatch_df = fetch_dispatch_prices(args.year, args.months, args.region, args.out_dir)
+    dispatch_df = fetch_dispatch_prices(args.year, args.months, args.region, args.out_dir, local)
 
     log.info("=== Deriving 30-min wholesale prices from dispatch prices ===")
     derive_wholesale_prices(dispatch_df, args.out_dir)
 
     if args.duid:
         log.info("=== Fetching DISPATCH_UNIT_SCADA for DUID=%s ===", args.duid)
-        fetch_unit_scada(args.year, args.months, args.duid, args.out_dir)
+        fetch_unit_scada(args.year, args.months, args.duid, args.out_dir, local)
     else:
         log.info("=== Fetching rooftop PV actual (%s) ===", args.region)
-        fetch_rooftop_solar(args.year, args.months, args.region, args.out_dir)
+        fetch_rooftop_solar(args.year, args.months, args.region, args.out_dir, local)
 
     log.info("=== All done — CSVs written to %s ===", args.out_dir)
 
