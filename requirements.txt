@@ -1,0 +1,5 @@
+pandas>=2.0
+numpy>=1.25
+matplotlib>=3.7
+scipy>=1.11        # available for future optimisation (LP dispatch scheduling)
+pytest>=7.4
