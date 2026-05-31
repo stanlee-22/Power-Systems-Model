@@ -29,8 +29,8 @@ Network note:
     1. In your browser, go to:
          https://nemweb.com.au/Data_Archive/Wholesale_Electricity/MMSDM/
          2025/MMSDM_2025_01/MMSDM_Historical_Data_SQLLoader/DATA/
-    2. Download PUBLIC_DVD_DISPATCHPRICE_202501010000.zip and
-                 PUBLIC_DVD_ROOFTOP_PV_ACTUAL_202501010000.zip
+    2. Download the DISPATCHPRICE and ROOFTOP_PV_ACTUAL ZIPs
+       (named PUBLIC_ARCHIVE#...# or PUBLIC_DVD_...)
        (repeat for each month)
     3. Place the ZIPs in any directory, then run:
          python scripts/fetch_aemo_data.py --region NSW1 --local-zip-dir /path/to/zips
@@ -61,12 +61,16 @@ log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MMSDM_BASE = (
+MMSDM_DIR = (
     "https://nemweb.com.au/Data_Archive/Wholesale_Electricity/MMSDM"
     "/{year}/MMSDM_{year}_{month:02d}"
     "/MMSDM_Historical_Data_SQLLoader/DATA"
-    "/PUBLIC_DVD_{table}_{year}{month:02d}010000.zip"
 )
+
+# 2025+ naming: PUBLIC_ARCHIVE#TABLE#FILE01#YYYYMM010000.zip
+# Pre-2025 naming: PUBLIC_DVD_TABLE_YYYYMM010000.zip
+MMSDM_ARCHIVE_FMT = MMSDM_DIR + "/PUBLIC_ARCHIVE%2523{table}%2523FILE01%2523{year}{month:02d}010000.zip"
+MMSDM_DVD_FMT = MMSDM_DIR + "/PUBLIC_DVD_{table}_{year}{month:02d}010000.zip"
 
 NEM_REGIONS = {"NSW1", "VIC1", "QLD1", "SA1", "TAS1"}
 
@@ -89,7 +93,7 @@ _HEADERS = {
 # ---------------------------------------------------------------------------
 
 def _download(url: str, retries: int = 4) -> bytes:
-    """GET with exponential backoff.  Returns raw bytes."""
+    """GET with exponential backoff.  Returns raw bytes.  Raises immediately on 404."""
     delay = 2
     for attempt in range(retries + 1):
         try:
@@ -97,6 +101,14 @@ def _download(url: str, retries: int = 4) -> bytes:
             r = requests.get(url, headers=_HEADERS, timeout=120)
             r.raise_for_status()
             return r.content
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                raise
+            if attempt == retries:
+                raise
+            log.warning("  Attempt %d failed (%s) — retrying in %ds", attempt + 1, exc, delay)
+            time.sleep(delay)
+            delay *= 2
         except requests.RequestException as exc:
             if attempt == retries:
                 raise
@@ -116,26 +128,49 @@ def _load_zip(
     Return raw ZIP bytes — from a local file if --local-zip-dir was given,
     otherwise download from NEMWeb.
 
-    Local file name convention (same as the MMSDM archive):
-      PUBLIC_DVD_{TABLE}_{YYYY}{MM}010000.zip
+    Checks both naming conventions (ARCHIVE# and DVD_) for local files.
     """
-    filename = f"PUBLIC_DVD_{table}_{year}{month:02d}010000.zip"
+    candidates = [
+        f"PUBLIC_ARCHIVE#DISPATCHPRICE#FILE01#{year}{month:02d}010000.zip"
+        if table == "DISPATCHPRICE" else
+        f"PUBLIC_ARCHIVE#{table}#FILE01#{year}{month:02d}010000.zip",
+        f"PUBLIC_DVD_{table}_{year}{month:02d}010000.zip",
+    ]
     if local_zip_dir is not None:
-        path = local_zip_dir / filename
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Expected local ZIP not found: {path}\n"
-                f"Download it from:\n"
-                f"  https://nemweb.com.au/Data_Archive/Wholesale_Electricity/MMSDM/"
-                f"{year}/MMSDM_{year}_{month:02d}/MMSDM_Historical_Data_SQLLoader/DATA/{filename}"
-            )
-        log.info("  Reading local file %s", path)
-        return path.read_bytes()
-    return _download(_mmsdm_url(table, year, month))
+        for filename in candidates:
+            path = local_zip_dir / filename
+            if path.exists():
+                log.info("  Reading local file %s", path)
+                return path.read_bytes()
+        raise FileNotFoundError(
+            f"Expected local ZIP not found in {local_zip_dir}\n"
+            f"Tried: {', '.join(candidates)}"
+        )
+    return _download_with_fallback(table, year, month)
 
 
-def _mmsdm_url(table: str, year: int, month: int) -> str:
-    return MMSDM_BASE.format(table=table, year=year, month=month)
+def _download_with_fallback(table: str, year: int, month: int) -> bytes:
+    """Try each candidate URL; return bytes from the first that succeeds."""
+    urls = _mmsdm_urls(table, year, month)
+    last_exc = None
+    for url in urls:
+        try:
+            return _download(url)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                log.info("  404 for %s — trying next format", url.split("/")[-1])
+                last_exc = exc
+                continue
+            raise
+    raise last_exc
+
+
+def _mmsdm_urls(table: str, year: int, month: int) -> list[str]:
+    """Return candidate URLs to try — new ARCHIVE format first, then legacy DVD."""
+    return [
+        MMSDM_ARCHIVE_FMT.format(table=table, year=year, month=month),
+        MMSDM_DVD_FMT.format(table=table, year=year, month=month),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +329,10 @@ def fetch_rooftop_solar(
             log.warning("  Skipping %d-%02d rooftop solar: %s", year, m, e)
             continue
 
-        df = _parse_aemo_zip(raw, "ROOFTOP_PV", "ACTUAL")
+        try:
+            df = _parse_aemo_zip(raw, "ROOFTOP_PV", "ACTUAL")
+        except ValueError:
+            df = _parse_aemo_zip(raw, "ROOFTOP", "ACTUAL")
         df = df[df["REGIONID"] == region]
 
         # Prefer MEASUREMENT type; fall back to SATELLITE
@@ -304,7 +342,8 @@ def fetch_rooftop_solar(
 
         ts_col = "INTERVAL_DATETIME" if "INTERVAL_DATETIME" in df.columns else "SETTLEMENTDATE"
         df["timestamp"] = pd.to_datetime(df[ts_col], dayfirst=False)
-        df["generation_mw"] = pd.to_numeric(df["POWER_MW"], errors="coerce").clip(lower=0)
+        pwr_col = "POWER" if "POWER" in df.columns else "POWER_MW"
+        df["generation_mw"] = pd.to_numeric(df[pwr_col], errors="coerce").clip(lower=0)
         chunks.append(df[["timestamp", "generation_mw"]])
         log.info("  %d-%02d: %d rooftop solar rows", year, m, len(df))
 
