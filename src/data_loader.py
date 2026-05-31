@@ -92,19 +92,52 @@ def build_master_frame(
     return df
 
 
+def build_master_frame_5min(
+    dispatch_prices: pd.Series,
+    solar_5min: pd.Series | None = None,
+    solar_30min: pd.Series | None = None,
+) -> pd.DataFrame:
+    """
+    Build a 5-minute resolution master frame for VSR dispatch modelling.
+
+    - Dispatch prices kept at native 5-min resolution (no resampling).
+    - 30-min solar forward-filled across six 5-min sub-intervals.
+    - No wholesale_price column — VSR uses dispatch prices directly.
+    """
+    if solar_5min is None and solar_30min is None:
+        raise ValueError("Provide at least one of solar_5min or solar_30min")
+
+    if solar_5min is not None:
+        solar_mw = solar_5min
+        if solar_30min is not None:
+            solar_mw = solar_mw.combine_first(
+                solar_30min.resample("5min").ffill()
+            )
+    else:
+        solar_mw = solar_30min.resample("5min").ffill()
+
+    df = pd.DataFrame({
+        "solar_mw": solar_mw,
+        "dispatch_price": dispatch_prices,
+    })
+
+    df = df.dropna(subset=["dispatch_price"])
+    df["solar_mw"] = df["solar_mw"].clip(lower=0).fillna(0)
+    return df
+
+
 def load_all(
     solar_5min_path: Path | None = None,
     solar_30min_path: Path | None = None,
     dispatch_path: Path | None = None,
     wholesale_path: Path | None = None,
+    resolution: str = "30min",
 ) -> pd.DataFrame:
     """
     Convenience wrapper: load raw files and return the aligned master frame.
 
-    Solar source resolution:
-      - Loads solar_5min.csv if it exists (or explicit path given).
-      - Loads solar_30min.csv if it exists (or explicit path given).
-      - At least one must be present.
+    resolution="30min" (default): 30-min frame with dispatch, wholesale, solar.
+    resolution="5min": 5-min frame with dispatch + solar only (for VSR).
     """
     path_5 = solar_5min_path or DATA_RAW / "solar_5min.csv"
     path_30 = solar_30min_path or DATA_RAW / "solar_30min.csv"
@@ -123,6 +156,9 @@ def load_all(
         )
 
     dispatch = load_dispatch_prices(dispatch_path)
-    wholesale = load_wholesale_prices(wholesale_path)
 
+    if resolution == "5min":
+        return build_master_frame_5min(dispatch, solar_5, solar_30)
+
+    wholesale = load_wholesale_prices(wholesale_path)
     return build_master_frame(dispatch, wholesale, solar_5, solar_30)
