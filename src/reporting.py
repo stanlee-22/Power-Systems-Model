@@ -12,17 +12,26 @@ from src.config import CHARTS
 
 def summarise(df: pd.DataFrame) -> pd.DataFrame:
     """Return a strategy-level revenue summary."""
+    agg_dict = {
+        "intervals": ("revenue", "count"),
+        "gross_revenue": ("revenue", lambda x: x[x > 0].sum()),
+        "costs": ("revenue", lambda x: x[x < 0].sum()),
+        "net_revenue": ("revenue", "sum"),
+        "energy_delivered": ("energy_delivered", "sum"),
+        "grid_bought": ("grid_bought", "sum"),
+        "soc_drawn": ("soc_drawn", "sum"),
+    }
+    if "vsrp_fee" in df.columns:
+        agg_dict["vsrp_fees"] = ("vsrp_fee", "sum")
+
     summary = (
         df.groupby("strategy")
-        .agg(
-            intervals=("revenue", "count"),
-            total_revenue=("revenue", "sum"),
-            avg_revenue_per_interval=("revenue", "mean"),
-            total_energy_dispatched=("energy_dispatched", "sum"),
-        )
+        .agg(**agg_dict)
         .round(2)
     )
-    summary.loc["TOTAL"] = summary.sum(numeric_only=True)
+    totals = summary.sum(numeric_only=True).round(2)
+    totals.name = "TOTAL"
+    summary = pd.concat([summary, totals.to_frame().T])
     return summary
 
 
@@ -38,8 +47,14 @@ def plot_results(df: pd.DataFrame, output_dir: Path | None = None) -> list[Path]
     output_dir.mkdir(parents=True, exist_ok=True)
     paths = []
 
-    # --- colour map for strategies ---
-    colour_map = {"dispatch": "#2196F3", "arbitrage": "#FF9800", "hold": "#9E9E9E"}
+    colour_map = {
+        "solar_shift": "#FF9800",
+        "arbitrage": "#2196F3",
+        "grid_charge": "#9C27B0",
+        "vsr_discharge": "#4CAF50",
+        "vsr_charge": "#E91E63",
+        "hold": "#9E9E9E",
+    }
     colours = df["strategy"].map(colour_map).fillna("#9E9E9E")
 
     # ------------------------------------------------------------------ #
@@ -52,9 +67,9 @@ def plot_results(df: pd.DataFrame, output_dir: Path | None = None) -> list[Path]
     ax1.bar(df.index, df["revenue"], color=colours, width=0.018, label="Interval revenue")
     ax1.set_ylabel("Revenue per interval ($)")
     ax1.set_title("Battery Revenue by Interval")
-    # Legend patches
     from matplotlib.patches import Patch
-    legend_elements = [Patch(facecolor=c, label=s) for s, c in colour_map.items()]
+    legend_elements = [Patch(facecolor=c, label=s) for s, c in colour_map.items()
+                       if s in df["strategy"].values]
     ax1.legend(handles=legend_elements, loc="upper left")
 
     ax2.plot(df.index, df["cumulative_revenue"], color="#4CAF50", linewidth=1.5)

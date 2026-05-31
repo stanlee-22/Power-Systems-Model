@@ -20,13 +20,8 @@ def compute_solar_charge(
 
     Returns (energy_charged_mwh, new_soc).
     """
-    # Energy available from solar this interval (MW × hours)
     available = solar_mw * battery.interval_hours * battery.charge_efficiency
-
-    # How much headroom is there in the battery?
     headroom = battery.capacity_mwh - current_soc
-
-    # Also respect the max charge rate
     max_per_interval = battery.max_charge_per_interval * battery.charge_efficiency
 
     charged = min(available, headroom, max_per_interval)
@@ -45,7 +40,9 @@ def run_soc_engine(df: pd.DataFrame, battery: BatteryConfig) -> pd.DataFrame:
       - solar_charged: energy absorbed from solar (MWh)
       - soc_after_solar: SoC after solar charging (before any market dispatch)
 
-    The revenue engine consumes `soc_after_solar` as its starting SoC.
+    NOTE: This is a standalone pre-pass. When used with the revenue engine,
+    prefer run_combined_engine() from revenue_engine.py which interleaves
+    charging and dispatch in a single pass for accurate SoC tracking.
     """
     n = len(df)
     soc_before = np.empty(n)
